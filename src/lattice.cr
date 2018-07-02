@@ -1,6 +1,7 @@
+require "logger"
 require "./lattice/*"
 
-# TODO: Write documentation for `Lattice`
+
 module Lattice
-  # TODO: Put your code here
+  alias GenNum = Float64 | Int32 | Int64 | Float32
 end

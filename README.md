@@ -1,6 +1,6 @@
 # lattice
 
-TODO: Write a description here
+Lattice::NArray is an n-dimensional Array class for the Crystal programming language to easily manipulate milti-dimensional data, inspired by numpy's ndarray. Credit to the ruby-numo/numo-narray project...this is a refactoring of their codebase for use in Crystal lang.
 
 ## Installation
 
@@ -9,7 +9,7 @@ Add this to your application's `shard.yml`:
 ```yaml
 dependencies:
   lattice:
-    github: your-github-user/lattice
+    github: londoed/lattice
 ```
 
 ## Usage
@@ -34,4 +34,4 @@ TODO: Write development instructions here
 
 ## Contributors
 
-- [your-github-user](https://github.com/your-github-user) londoed - creator, maintainer
+- [londoed](https://github.com/londoed) Eric Londo - creator, maintainer
