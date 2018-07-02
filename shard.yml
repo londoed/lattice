@@ -1,0 +1,9 @@
+name: lattice
+version: 0.1.0
+
+authors:
+  - londoed <londoed@comcast.net>
+
+crystal: 0.25.1
+
+license: MIT
