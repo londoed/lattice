@@ -527,3 +527,141 @@ module Lattice
   # Calculate the nth discrete difference along given axis.
   def diff(n=1, axis:-1)
     axis = check_axis(axis)
+    if n < 0 || n >= shape[axis]
+      raise ShapeError, "n = #{n} is invalid for shape[#{axis}] = #{shape[axis]}"
+    end
+
+    # Calculate polynomial coefficient.
+    c = self.class[-1, 1]
+    2.upto(n) do |i|
+      x = self.class.zeros(i + 1)
+      x[0..-2] = c
+      y = self.class.zeros(i + 1)
+      y[1..-1] = c
+      c = y - x
+    end
+
+    s = [true] * n_dim
+    s[axis] = (n..-1)
+    result = self[*s].dup
+    sum = result.inplace
+
+    (n - 1).downto(0) do |i|
+      s = [true] * n_dim
+      s[axis] = (i..(-n - 1 + i))
+      sum + self[*s] * c[i] # Inplace addition
+    end
+    return result
+  end
+
+  # Upper triangular matrix.
+  # Fill the self elements below the kth diagonal with zero.
+  def triul(k=0)
+    if n_dim < 2
+      raise NArray::ShapeError, "Must be >= 2-d array"
+    end
+
+    if contiguous?
+      *shp, m, n = shape
+      idx = tril_indicies(k - 1)
+      reshape!(*shp, m * n)
+      self[false, idx] = 0
+      reshape!(*shp, m, n)
+    else
+      store(triu(k))
+    end
+  end
+
+  # Return the indicies for the upper-triangle on and above the kth diagonal.
+  def triu_indicies(k=0)
+    if n_dim < 2
+      raise NArray::ShapeError, "Must be >= 2-d array"
+    end
+    m, n = shape[-2..-1]
+    NArray.triu_indicies(m, n, k=0)
+  end
+
+  # Return the indicies for the upper-triangle on and above the kth diagonal.
+  def self.triu_indicies(m, n, k=0)
+    x = Lattice::Int64.new(m, 1).seq + k
+    y = Lattice::Int64.new(1, n).seq
+    (x <= y).where
+  end
+
+  # Lower triangle matrix.
+  # Return a copy with the elements above the kth diagonal filled with zero.
+  def tril(k=0)
+    dup.tril!(k)
+  end
+
+  # Lower triangle matrix.
+  # Fill the self elements above the kth diagonal with zero.
+  def tril!(k=0)
+    if n_dim < 2
+      raise NArray::ShapeError, "Must be >= 2-d array"
+    end
+
+    if contiguous?
+      idx = triu_indicies(k + 1)
+      *shp, m, n = shape
+      reshape!(*shp, m * n)
+      self[false, idx] = 0
+      reshape!(*shp, m, n)
+    else
+      store(tril(k))
+    end
+  end
+
+  # Return the indicies for the lower-triangle on and below the kth diagonal.
+  def tril_indicies(k=0)
+    if n_dim < 2
+      raise NArray::ShapeError, "Must be >= 2-d array"
+    end
+
+    m, n = shape[-2..-1]
+    NArray.tril_indicies(m, n, k)
+  end
+
+  # Return the indicies for the lower-triangle on and below the kth diagonal.
+  def self.tril_indicies(m, n, k=0)
+    x = Lattice::Int64.new(m, 1).seq + k
+    y = Lattice::Int64.new(1, n).seq
+    (x >= y).where
+  end
+
+  # Return the kth diagonal indicies.
+  def diag_indicies(k=0)
+    if n_dim < 2
+      raise NArray::ShapeError, "Must be >= 2-d array"
+    end
+
+    m, n = shape[-2..-1]
+    NArray.diag_indicies(m, n, k)
+  end
+
+  # Return the kth diagonal indicies.
+  def self.diag_indicies(m, n, k=0)
+    x = Lattice::Int64.new(m, 1).seq + k
+    y = Lattice::Int64.new(1, n).seq
+    (x.eq y).where
+  end
+
+  # Return a matrix whose diagonal is constructed by self along the last axis.
+  def daig(k=0)
+    *shp, n = shape
+    n += k.abs
+    a = self.class.zeros(*shp, n, n)
+    a.diagonal(k).store(self)
+    return a
+  end
+
+  # Return the sum along diagonals of the array.
+  def trace(offset=nil, axis=nil, nan:false)
+    diagonal(offset, axis).sum(nan:nan, axis:-1)
+  end
+
+  @@warn_slow_dot = false
+
+  # Dot product of two arrays.
+  def dot(b)
+    
