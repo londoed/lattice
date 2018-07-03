@@ -125,7 +125,6 @@ module Lattice
     end
 
     # Parse matrix like matlab, octave.
-
     def self.parse(str, split1d:/\s+/, split2d:/;?$|;/, split3d:/\s*\n(\s*\n)+/m)
       a = [] of String
       str.split(split3d).each do |block|
@@ -189,5 +188,342 @@ module Lattice
 
     # Return a new array with sub-arrays along an axis deleted.
     # If axis is not given, obj is applied to the flattened array.
+    def delete(indice, axis=nil)
+      if axis
+        bit = Bit.ones(shape[axis])
+        bit[indice] = 0
+        idx = [true] * n_dim
+        idx[axis] = bit.where
+        return self[bit.where].copy
+      end
+    end
 
-    
+    # Insert values along the axis before the indicies.
+    def insert(indice, values, axis:nil)
+      if axis
+        values = self.class.as_array(values)
+        nd = values.n_dim
+        mid_x = [:new] * (n_dim - nd) + [true] * nd
+        case indice
+        when Numeric
+          mix_d[-nd - 1] = true
+          mix_d[axis] = :new
+        end
+        values = values[*mid_x]
+      else
+        values = self.class.as_array(values).flatten
+      end
+
+      idx = Int64.as_array(indice)
+      n_idx = idx.size
+      if n_idx == 1
+        n_idx = values.shape[axis || 0]
+        idx += Int64.new(n_idx).seq
+      else
+        s_idx = idx.sort_index
+        idx[s_idx] += Int64.new(n_idx).seq
+      end
+
+      if axis
+        bit = Bit.ones(shape[axis] + n_idx)
+        bit[idx] = 0
+        new_shape = shape
+        sew_shape[axis] += n_idx
+        a = self.class.zeros(new_shape)
+        md_idx = [true] * n_dim
+        md_idx[axis] = bit.where
+        a[*md_idx] = self
+        md_idx[axis] = idx
+        a[*md_idx] = values
+      else
+        bit = Bit.ones(size + n_idx)
+        bit[idx] = 0
+        a = self.class.zeros(size + n_idx)
+        a[bit.where] = self.flatten
+        a[idx] = values
+      end
+      return a
+    end
+
+    class << self
+
+    def concatenate(arrays, axis:0)
+      klass = (self == NArray) ? NArray.array_type(arrays) : self
+      nd = 0
+      arrays = arrays.map do |a|
+        case a
+        when NArray
+          # ok
+        when Numeric
+          a = klass[a]
+        when Array
+          a = klass.cast(a)
+        else
+          raise TypeError, "Not Lattice::NArray: #{a.inspect[0..48]}"
+        end
+        return a
+      end
+
+      if axis < 0
+        axis += nd
+      end
+
+      if axis < 0 || axis >= nd
+        raise ArgumentError, "Axis is out of range"
+      end
+
+      new_shape = nil
+      sum_size = 0
+      arrays.each do |a|
+        a_shape = a.shape
+        if nd != a_shape.size
+          a_shape = [1] * (nd - a_shape.size) + a_shape
+        end
+        sum_size += a_shape.delete_at(axis)
+
+        if new_shape
+          if new_shape != a_shape
+            raise ShapeError, "Shape mismatch"
+          end
+        else
+          new_shape = a_shape
+        end
+      end
+
+      new_shape.insert(axis, sum_size)
+      result = klass.zeros(*new_shape)
+      lst = 0
+      refs = [true] * nd
+
+      arrays.each do |a|
+        fst = lst
+        lst = fst + (a.shape[axis - nd] || 1)
+        refs[axis] = (fst...lst)
+        result[*refs] = a
+      end
+      return result
+    end
+
+    # Stack arrays vertically (row wise)
+    def v_stack(arrays)
+      arys = arrays.map do |a|
+        _atleast_2d(cast(a))
+      end
+      concatenate(arys, axis:0)
+    end
+
+    # Stack arrays horizontally (column wise)
+    def h_stack(arrays)
+      klass = (self == NArray) ? NArray.array_type(arrays) : self
+      nd = 0
+      arys = arrays.map do |a|
+        a = klass.cast(a)
+        nd = a.n_dim if a.n_dim > nd
+        a
+      end
+      dim = (nd >= 2) ? 1 : 0
+      concatenate(arys, axis:dim)
+    end
+
+    # Stack arrays in depth wise (along third axis).
+    def d_stack(arrays)
+      arys = arrays.map do |a|
+        _atleast_3d(cast(a))
+      end
+      concatenate(arys, axis:2)
+    end
+
+    # Stack 1-d arrays into columns of a 2-d array.
+    def column_stack(arrays)
+      arys = arrays.map do |a|
+        a = cast(a)
+        case a.n_dim
+        when 0; a[:new, :new]
+        when 1; a[true, :new]
+        else; a
+        end
+      end
+      concatenate(arys, axis:1)
+    end
+
+    # Return an NArray with at least two dimensions.
+    private def _atleast_2d(a)
+      case a.n_dim
+      when 0; a[:new, :new]
+      when 1; a[:new, true]
+      else; a
+      end
+    end
+
+    # Return an NArray with at least three dimensions.
+    private def _atleast_3d(a)
+      case a.n_dim
+      when 0; a[:new, :new, :new]
+      when 1; a[:new, true, :new]
+      when 2; a[true, true, :new]
+      else; a
+      end
+    end
+
+  end # class << self
+
+  def concatenate(*arrays, axis:0)
+    axis = check_axis(axis)
+    self_shape = shape
+    self_shape.delete_at(axis)
+    sum_size = shape[axis]
+    arrays.map! do |a|
+      case a
+      when NArray
+        # ok
+      when Numeric
+        a = self.class.new(1).store(a)
+      when Array
+        a = self.class.cast(a)
+      else
+        raise TypeError, "Not Lattice::NArray: #{a.inspect[0..48]}"
+      end
+
+      a_shape = a.shape
+      sum_size += a_shape.delete_at(axis - n_dim) || 1
+
+      if self_shape != a_shape
+        raise ShapeError, "Shape mismatch"
+      end
+      return a
+    end
+
+    self_shape.insert(axis, sum_size)
+    result = self.class.zeros(*self_shape)
+    lst = shape[axis]
+    refs = [true] * n_dim
+    refs[axis] = (0...lst)
+    result[*refs] = self
+    arrays.each do |a|
+      fst = lst
+      lst = fst + (a.shape[axis - n_dim] || 1)
+      refs[axis] = (fst...lst)
+      result[*refs] = a
+    end
+    return result
+  end
+
+  def split(indicies_or_sections, axis:0)
+    axis = check_axis(axis)
+    size_axis = shape[axis]
+    case indicies_or_sections
+    when Integer
+      div_axis, mod_axis = size_axis.div_mod(indicies_or_sections)
+      refs = [true] * n_dim
+      beg_idx = 0
+      mod_axis.times.map do |i|
+        end_idx = beg_idx + div_axis + 1
+        refs[axis] = (beg_idx...end_idx)
+        beg_idx = end_idx
+        self[*refs]
+      end +
+      (indicies_or_sections - mod_axis).times.map do |i|
+        end_idx = beg_idx + div_axis
+        refs[axis] = (beg_idx...end_idx)
+        beg_idx = end_idx
+        self[*refs]
+      end
+    when NArray
+      split(indicies_or_sections.to_a, axis:axis)
+    when Array
+      refs = [true] * n_dim
+      fst = 0
+      (indicies_or_sections + [size_axis]).map do |lst|
+        lst = size_axis if lst > size_axis
+        refs[axis] = (fst < size_axis) ? (fst...lst) : (-1...1)
+        fst = lst
+        self[*refs]
+      end
+    else
+      raise TypeError, "Argument must be Integer or Array"
+    end
+  end
+
+  def v_split(indicies_or_sections)
+    split(indicies_or_sections, axis:0)
+  end
+
+  def h_split(indicies_or_sections)
+    split(indicies_or_sections, axis:1)
+  end
+
+  def d_split(indicies_or_sections)
+    split(indicies_or_sections, axis:2)
+  end
+
+  def tile(*arg)
+    arg.each do |i|
+      if !i.kind_of?(Integer) || i < 1
+        raise ArgumentError, "Argument should be positive integer"
+      end
+    end
+
+    ns = arg.size
+    nd = self.n_dim
+    shp = self.shape
+    new_shp = [] of GenNum
+    src_shp = [] of GenNum
+    res_shp = [] of GenNum
+    (nd - ns).times do
+      new_shp << 1
+      new_shp << (n = shp.shift)
+      src_shp << :new
+      src_shp << true
+      res_shp << n
+    end
+
+    (nd - ns).times do
+      new_shp << (m = arg.shift)
+      new_shp << (n = shp.shift)
+      src_shp << :new
+      src_shp << true
+      res_shp << (n * m)
+    end
+    self.class.new(*new_shp).store(self[*src_shp]).reshape(*res_shp)
+  end
+
+  def repeat(arg, axis:nil)
+    case axis
+    when Integer
+      axis = check_axis(axis)
+      c = self
+    when NilClass
+      c = self.flatten
+      axis = 0
+    else
+      raise ArgumentError, "Invalid axis"
+    end
+
+    case arg
+    when Integer
+      if !arg.kind_of?(Integer) || arg < 1
+        raise ArgumentError, "Argument should be positive integer"
+      end
+      idx = c.shape[axis].times.map { |i| [i] * arg }.flatten
+    else
+      arg = arg.to_a
+      if arg.size != c.shape[axis]
+        raise ArgumentError, "Repeat size should be equal to size along axis"
+      end
+
+      arg.each do |i|
+        if !i.kind_of?(Integer) || i < 0
+          raise ArgumentError, "Argument should be non-negative integer"
+        end
+      end
+      idx = arg.each_with_index.map { |a, i| [i] * a }.flatten
+    end
+
+    ref = [true] * c.n_dim
+    ref[axis] = idx
+    return c[*ref].copy
+  end
+
+  # Calculate the nth discrete difference along given axis.
+  def diff(n=1, axis:-1)
+    axis = check_axis(axis)
