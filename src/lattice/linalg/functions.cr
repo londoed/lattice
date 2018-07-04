@@ -225,4 +225,57 @@ module Lattice ; module Linalg
     end
   end
 
+  # Solves a system of linear equations.
+  #
+  # A * X = B or A**T * X = B
+  #
+  # With a NxN matrix A using the LU factorization computed by Lattice::Linalg.lu_fact.
+
+  def lu_solve(lu, ipiv, b, driver:"gen", uplo:"U", trans:"N")
+    case driver.to_s
+    when /^gen?(trs)?$/i
+      Lapack.call(:getrs, ls, ipiv, b, trans:trans)[0]
+    when /^(sym?|her?)(trs)?$/i
+      func = driver[0..2].downcase + "trs"
+      Lapack.call(func. lu, ipiv, b, uplo:uplo)[0]
+    else
+      raise ArgumentError, "Invaid driver: #{driver}"
+    end
+  end
+
+  # Computes the Cholesky factorization of symmetric/Hermitian.
+  # Positive definite matrix A. The factorization has the form:
+  #
+  # A = U**H * U, if UPLO = 'U', or
+  # A = L * L**H, UPLO = L,
+  #
+
+  def cho_inv(a, uplo:'U')
+    Lapack.call(:potri, a, uplo)[0]
+  end
+
+  # Solves a system of linear equations.
+  # A * X = B
+  # With symmetric/Hermitian positive definite matrix A using the Cholesky factorization.
+  def cho_solve(a, b, uplo:'U')
+    Lapack.call(:potrs, a, b, uplo:uplo)[0]
+  end
+
+  ## Matrix eigenvalues
+
+  # Computes the eigenvalues and, optionally, the left and/or right eigenvectors for a square non-symmetric matrix A.
+  def eig(a, left:false, right:true)
+    jobvl, jobvr = left, right
+    case blas_char(a)
+    when /c|z/
+      w, wl, vr, info = Lapack.call(:geev, a, jobvl:jobvl, jobvr:jobvr)
+    else
+      wr, wi, vl, vr, info = Lapack.call(:geev, a, jobvl:jobvl, jobvr:jobvr)
+      w = wr + wi * Complex::I
+      vl = _make_complex_eigvecs(w, vl) if left
+      vr = _make_complex_eigvecs(w, vr) if right
+    end
+    return [w, vl, wr]
+  end
+
   
