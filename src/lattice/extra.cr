@@ -367,301 +367,330 @@ module Lattice
 
   end # class << self
 
-  def concatenate(*arrays, axis:0)
-    axis = check_axis(axis)
-    self_shape = shape
-    self_shape.delete_at(axis)
-    sum_size = shape[axis]
-    arrays.map! do |a|
-      case a
+    def concatenate(*arrays, axis:0)
+      axis = check_axis(axis)
+      self_shape = shape
+      self_shape.delete_at(axis)
+      sum_size = shape[axis]
+      arrays.map! do |a|
+        case a
+        when NArray
+          # ok
+        when Numeric
+          a = self.class.new(1).store(a)
+        when Array
+          a = self.class.cast(a)
+        else
+          raise TypeError, "Not Lattice::NArray: #{a.inspect[0..48]}"
+        end
+
+        a_shape = a.shape
+        sum_size += a_shape.delete_at(axis - n_dim) || 1
+
+        if self_shape != a_shape
+          raise ShapeError, "Shape mismatch"
+        end
+        return a
+      end
+
+      self_shape.insert(axis, sum_size)
+      result = self.class.zeros(*self_shape)
+      lst = shape[axis]
+      refs = [true] * n_dim
+      refs[axis] = (0...lst)
+      result[*refs] = self
+      arrays.each do |a|
+        fst = lst
+        lst = fst + (a.shape[axis - n_dim] || 1)
+        refs[axis] = (fst...lst)
+        result[*refs] = a
+      end
+      return result
+    end
+
+    def split(indicies_or_sections, axis:0)
+      axis = check_axis(axis)
+      size_axis = shape[axis]
+      case indicies_or_sections
+      when Integer
+        div_axis, mod_axis = size_axis.div_mod(indicies_or_sections)
+        refs = [true] * n_dim
+        beg_idx = 0
+        mod_axis.times.map do |i|
+          end_idx = beg_idx + div_axis + 1
+          refs[axis] = (beg_idx...end_idx)
+          beg_idx = end_idx
+          self[*refs]
+        end +
+        (indicies_or_sections - mod_axis).times.map do |i|
+          end_idx = beg_idx + div_axis
+          refs[axis] = (beg_idx...end_idx)
+          beg_idx = end_idx
+          self[*refs]
+        end
       when NArray
-        # ok
-      when Numeric
-        a = self.class.new(1).store(a)
+        split(indicies_or_sections.to_a, axis:axis)
       when Array
-        a = self.class.cast(a)
+        refs = [true] * n_dim
+        fst = 0
+        (indicies_or_sections + [size_axis]).map do |lst|
+          lst = size_axis if lst > size_axis
+          refs[axis] = (fst < size_axis) ? (fst...lst) : (-1...1)
+          fst = lst
+          self[*refs]
+        end
       else
-        raise TypeError, "Not Lattice::NArray: #{a.inspect[0..48]}"
+        raise TypeError, "Argument must be Integer or Array"
+      end
+    end
+
+    def v_split(indicies_or_sections)
+      split(indicies_or_sections, axis:0)
+    end
+
+    def h_split(indicies_or_sections)
+      split(indicies_or_sections, axis:1)
+    end
+
+    def d_split(indicies_or_sections)
+      split(indicies_or_sections, axis:2)
+    end
+
+    def tile(*arg)
+      arg.each do |i|
+        if !i.kind_of?(Integer) || i < 1
+          raise ArgumentError, "Argument should be positive integer"
+        end
       end
 
-      a_shape = a.shape
-      sum_size += a_shape.delete_at(axis - n_dim) || 1
-
-      if self_shape != a_shape
-        raise ShapeError, "Shape mismatch"
+      ns = arg.size
+      nd = self.n_dim
+      shp = self.shape
+      new_shp = [] of GenNum
+      src_shp = [] of GenNum
+      res_shp = [] of GenNum
+      (nd - ns).times do
+        new_shp << 1
+        new_shp << (n = shp.shift)
+        src_shp << :new
+        src_shp << true
+        res_shp << n
       end
+
+      (nd - ns).times do
+        new_shp << (m = arg.shift)
+        new_shp << (n = shp.shift)
+        src_shp << :new
+        src_shp << true
+        res_shp << (n * m)
+      end
+      self.class.new(*new_shp).store(self[*src_shp]).reshape(*res_shp)
+    end
+
+    def repeat(arg, axis:nil)
+      case axis
+      when Integer
+        axis = check_axis(axis)
+        c = self
+      when NilClass
+        c = self.flatten
+        axis = 0
+      else
+        raise ArgumentError, "Invalid axis"
+      end
+
+      case arg
+      when Integer
+        if !arg.kind_of?(Integer) || arg < 1
+          raise ArgumentError, "Argument should be positive integer"
+        end
+        idx = c.shape[axis].times.map { |i| [i] * arg }.flatten
+      else
+        arg = arg.to_a
+        if arg.size != c.shape[axis]
+          raise ArgumentError, "Repeat size should be equal to size along axis"
+        end
+
+        arg.each do |i|
+          if !i.kind_of?(Integer) || i < 0
+            raise ArgumentError, "Argument should be non-negative integer"
+          end
+        end
+        idx = arg.each_with_index.map { |a, i| [i] * a }.flatten
+      end
+
+      ref = [true] * c.n_dim
+      ref[axis] = idx
+      return c[*ref].copy
+    end
+
+    # Calculate the nth discrete difference along given axis.
+    def diff(n=1, axis:-1)
+      axis = check_axis(axis)
+      if n < 0 || n >= shape[axis]
+        raise ShapeError, "n = #{n} is invalid for shape[#{axis}] = #{shape[axis]}"
+      end
+
+      # Calculate polynomial coefficient.
+      c = self.class[-1, 1]
+      2.upto(n) do |i|
+        x = self.class.zeros(i + 1)
+        x[0..-2] = c
+        y = self.class.zeros(i + 1)
+        y[1..-1] = c
+        c = y - x
+      end
+
+      s = [true] * n_dim
+      s[axis] = (n..-1)
+      result = self[*s].dup
+      sum = result.inplace
+
+      (n - 1).downto(0) do |i|
+        s = [true] * n_dim
+        s[axis] = (i..(-n - 1 + i))
+        sum + self[*s] * c[i] # Inplace addition
+      end
+      return result
+    end
+
+    # Upper triangular matrix.
+    # Fill the self elements below the kth diagonal with zero.
+    def triul(k=0)
+      if n_dim < 2
+        raise NArray::ShapeError, "Must be >= 2-d array"
+      end
+
+      if contiguous?
+        *shp, m, n = shape
+        idx = tril_indicies(k - 1)
+        reshape!(*shp, m * n)
+        self[false, idx] = 0
+        reshape!(*shp, m, n)
+      else
+        store(triu(k))
+      end
+    end
+
+    # Return the indicies for the upper-triangle on and above the kth diagonal.
+    def triu_indicies(k=0)
+      if n_dim < 2
+        raise NArray::ShapeError, "Must be >= 2-d array"
+      end
+      m, n = shape[-2..-1]
+      NArray.triu_indicies(m, n, k=0)
+    end
+
+    # Return the indicies for the upper-triangle on and above the kth diagonal.
+    def self.triu_indicies(m, n, k=0)
+      x = Lattice::Int64.new(m, 1).seq + k
+      y = Lattice::Int64.new(1, n).seq
+      (x <= y).where
+    end
+
+    # Lower triangle matrix.
+    # Return a copy with the elements above the kth diagonal filled with zero.
+    def tril(k=0)
+      dup.tril!(k)
+    end
+
+    # Lower triangle matrix.
+    # Fill the self elements above the kth diagonal with zero.
+    def tril!(k=0)
+      if n_dim < 2
+        raise NArray::ShapeError, "Must be >= 2-d array"
+      end
+
+      if contiguous?
+        idx = triu_indicies(k + 1)
+        *shp, m, n = shape
+        reshape!(*shp, m * n)
+        self[false, idx] = 0
+        reshape!(*shp, m, n)
+      else
+        store(tril(k))
+      end
+    end
+
+    # Return the indicies for the lower-triangle on and below the kth diagonal.
+    def tril_indicies(k=0)
+      if n_dim < 2
+        raise NArray::ShapeError, "Must be >= 2-d array"
+      end
+
+      m, n = shape[-2..-1]
+      NArray.tril_indicies(m, n, k)
+    end
+
+    # Return the indicies for the lower-triangle on and below the kth diagonal.
+    def self.tril_indicies(m, n, k=0)
+      x = Lattice::Int64.new(m, 1).seq + k
+      y = Lattice::Int64.new(1, n).seq
+      (x >= y).where
+    end
+
+    # Return the kth diagonal indicies.
+    def diag_indicies(k=0)
+      if n_dim < 2
+        raise NArray::ShapeError, "Must be >= 2-d array"
+      end
+
+      m, n = shape[-2..-1]
+      NArray.diag_indicies(m, n, k)
+    end
+
+    # Return the kth diagonal indicies.
+    def self.diag_indicies(m, n, k=0)
+      x = Lattice::Int64.new(m, 1).seq + k
+      y = Lattice::Int64.new(1, n).seq
+      (x.eq y).where
+    end
+
+    # Return a matrix whose diagonal is constructed by self along the last axis.
+    def daig(k=0)
+      *shp, n = shape
+      n += k.abs
+      a = self.class.zeros(*shp, n, n)
+      a.diagonal(k).store(self)
       return a
     end
 
-    self_shape.insert(axis, sum_size)
-    result = self.class.zeros(*self_shape)
-    lst = shape[axis]
-    refs = [true] * n_dim
-    refs[axis] = (0...lst)
-    result[*refs] = self
-    arrays.each do |a|
-      fst = lst
-      lst = fst + (a.shape[axis - n_dim] || 1)
-      refs[axis] = (fst...lst)
-      result[*refs] = a
-    end
-    return result
-  end
-
-  def split(indicies_or_sections, axis:0)
-    axis = check_axis(axis)
-    size_axis = shape[axis]
-    case indicies_or_sections
-    when Integer
-      div_axis, mod_axis = size_axis.div_mod(indicies_or_sections)
-      refs = [true] * n_dim
-      beg_idx = 0
-      mod_axis.times.map do |i|
-        end_idx = beg_idx + div_axis + 1
-        refs[axis] = (beg_idx...end_idx)
-        beg_idx = end_idx
-        self[*refs]
-      end +
-      (indicies_or_sections - mod_axis).times.map do |i|
-        end_idx = beg_idx + div_axis
-        refs[axis] = (beg_idx...end_idx)
-        beg_idx = end_idx
-        self[*refs]
-      end
-    when NArray
-      split(indicies_or_sections.to_a, axis:axis)
-    when Array
-      refs = [true] * n_dim
-      fst = 0
-      (indicies_or_sections + [size_axis]).map do |lst|
-        lst = size_axis if lst > size_axis
-        refs[axis] = (fst < size_axis) ? (fst...lst) : (-1...1)
-        fst = lst
-        self[*refs]
-      end
-    else
-      raise TypeError, "Argument must be Integer or Array"
-    end
-  end
-
-  def v_split(indicies_or_sections)
-    split(indicies_or_sections, axis:0)
-  end
-
-  def h_split(indicies_or_sections)
-    split(indicies_or_sections, axis:1)
-  end
-
-  def d_split(indicies_or_sections)
-    split(indicies_or_sections, axis:2)
-  end
-
-  def tile(*arg)
-    arg.each do |i|
-      if !i.kind_of?(Integer) || i < 1
-        raise ArgumentError, "Argument should be positive integer"
-      end
+    # Return the sum along diagonals of the array.
+    def trace(offset=nil, axis=nil, nan:false)
+      diagonal(offset, axis).sum(nan:nan, axis:-1)
     end
 
-    ns = arg.size
-    nd = self.n_dim
-    shp = self.shape
-    new_shp = [] of GenNum
-    src_shp = [] of GenNum
-    res_shp = [] of GenNum
-    (nd - ns).times do
-      new_shp << 1
-      new_shp << (n = shp.shift)
-      src_shp << :new
-      src_shp << true
-      res_shp << n
-    end
+    @@warn_slow_dot = false
 
-    (nd - ns).times do
-      new_shp << (m = arg.shift)
-      new_shp << (n = shp.shift)
-      src_shp << :new
-      src_shp << true
-      res_shp << (n * m)
-    end
-    self.class.new(*new_shp).store(self[*src_shp]).reshape(*res_shp)
-  end
-
-  def repeat(arg, axis:nil)
-    case axis
-    when Integer
-      axis = check_axis(axis)
-      c = self
-    when NilClass
-      c = self.flatten
-      axis = 0
-    else
-      raise ArgumentError, "Invalid axis"
-    end
-
-    case arg
-    when Integer
-      if !arg.kind_of?(Integer) || arg < 1
-        raise ArgumentError, "Argument should be positive integer"
-      end
-      idx = c.shape[axis].times.map { |i| [i] * arg }.flatten
-    else
-      arg = arg.to_a
-      if arg.size != c.shape[axis]
-        raise ArgumentError, "Repeat size should be equal to size along axis"
-      end
-
-      arg.each do |i|
-        if !i.kind_of?(Integer) || i < 0
-          raise ArgumentError, "Argument should be non-negative integer"
+    # Dot product of two arrays.
+    def dot(b)
+      t = self.class::UPCAST[b.class]
+      if defined?(Linalg) && [SFloat, DFloat, SComplex, DComplex].include?(t)
+        Linalg.dot(self, b)
+      else
+        b = self.class.as_array(b)
+      case b.n_dim
+      when 1
+        mulsum(b, axis:-1)
+      else
+        case n_dim
+        when 0
+          b.mulsum(self, axis:-2)
+        when 1
+          self[true, :new].mulsum(b, axis:-2)
+        else
+          unless @@warn_slow_dot
+            nx = 200
+            ns = 200_000
+            am, an = shape[-2..-1]
+            bm, bn = b.shape[-2..-1]
+            if am > nx && an > nx && bm > nx && bn > nx && size > ns && b.size > ns
+              @@warn_slow_dot = true
+              warn "\nWarning: Built-in matrix dot is slow. Consider installing Lattice::Linalg.\n\n"
+            end
+          end
+          return self[false, :new].mulsum(b[false, :new, true, true], axis=-2)
         end
       end
-      idx = arg.each_with_index.map { |a, i| [i] * a }.flatten
     end
-
-    ref = [true] * c.n_dim
-    ref[axis] = idx
-    return c[*ref].copy
-  end
-
-  # Calculate the nth discrete difference along given axis.
-  def diff(n=1, axis:-1)
-    axis = check_axis(axis)
-    if n < 0 || n >= shape[axis]
-      raise ShapeError, "n = #{n} is invalid for shape[#{axis}] = #{shape[axis]}"
     end
-
-    # Calculate polynomial coefficient.
-    c = self.class[-1, 1]
-    2.upto(n) do |i|
-      x = self.class.zeros(i + 1)
-      x[0..-2] = c
-      y = self.class.zeros(i + 1)
-      y[1..-1] = c
-      c = y - x
-    end
-
-    s = [true] * n_dim
-    s[axis] = (n..-1)
-    result = self[*s].dup
-    sum = result.inplace
-
-    (n - 1).downto(0) do |i|
-      s = [true] * n_dim
-      s[axis] = (i..(-n - 1 + i))
-      sum + self[*s] * c[i] # Inplace addition
-    end
-    return result
-  end
-
-  # Upper triangular matrix.
-  # Fill the self elements below the kth diagonal with zero.
-  def triul(k=0)
-    if n_dim < 2
-      raise NArray::ShapeError, "Must be >= 2-d array"
-    end
-
-    if contiguous?
-      *shp, m, n = shape
-      idx = tril_indicies(k - 1)
-      reshape!(*shp, m * n)
-      self[false, idx] = 0
-      reshape!(*shp, m, n)
-    else
-      store(triu(k))
-    end
-  end
-
-  # Return the indicies for the upper-triangle on and above the kth diagonal.
-  def triu_indicies(k=0)
-    if n_dim < 2
-      raise NArray::ShapeError, "Must be >= 2-d array"
-    end
-    m, n = shape[-2..-1]
-    NArray.triu_indicies(m, n, k=0)
-  end
-
-  # Return the indicies for the upper-triangle on and above the kth diagonal.
-  def self.triu_indicies(m, n, k=0)
-    x = Lattice::Int64.new(m, 1).seq + k
-    y = Lattice::Int64.new(1, n).seq
-    (x <= y).where
-  end
-
-  # Lower triangle matrix.
-  # Return a copy with the elements above the kth diagonal filled with zero.
-  def tril(k=0)
-    dup.tril!(k)
-  end
-
-  # Lower triangle matrix.
-  # Fill the self elements above the kth diagonal with zero.
-  def tril!(k=0)
-    if n_dim < 2
-      raise NArray::ShapeError, "Must be >= 2-d array"
-    end
-
-    if contiguous?
-      idx = triu_indicies(k + 1)
-      *shp, m, n = shape
-      reshape!(*shp, m * n)
-      self[false, idx] = 0
-      reshape!(*shp, m, n)
-    else
-      store(tril(k))
-    end
-  end
-
-  # Return the indicies for the lower-triangle on and below the kth diagonal.
-  def tril_indicies(k=0)
-    if n_dim < 2
-      raise NArray::ShapeError, "Must be >= 2-d array"
-    end
-
-    m, n = shape[-2..-1]
-    NArray.tril_indicies(m, n, k)
-  end
-
-  # Return the indicies for the lower-triangle on and below the kth diagonal.
-  def self.tril_indicies(m, n, k=0)
-    x = Lattice::Int64.new(m, 1).seq + k
-    y = Lattice::Int64.new(1, n).seq
-    (x >= y).where
-  end
-
-  # Return the kth diagonal indicies.
-  def diag_indicies(k=0)
-    if n_dim < 2
-      raise NArray::ShapeError, "Must be >= 2-d array"
-    end
-
-    m, n = shape[-2..-1]
-    NArray.diag_indicies(m, n, k)
-  end
-
-  # Return the kth diagonal indicies.
-  def self.diag_indicies(m, n, k=0)
-    x = Lattice::Int64.new(m, 1).seq + k
-    y = Lattice::Int64.new(1, n).seq
-    (x.eq y).where
-  end
-
-  # Return a matrix whose diagonal is constructed by self along the last axis.
-  def daig(k=0)
-    *shp, n = shape
-    n += k.abs
-    a = self.class.zeros(*shp, n, n)
-    a.diagonal(k).store(self)
-    return a
-  end
-
-  # Return the sum along diagonals of the array.
-  def trace(offset=nil, axis=nil, nan:false)
-    diagonal(offset, axis).sum(nan:nan, axis:-1)
-  end
-
-  @@warn_slow_dot = false
-
-  # Dot product of two arrays.
-  def dot(b)
-    
