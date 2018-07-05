@@ -278,4 +278,188 @@ module Lattice ; module Linalg
     return [w, vl, wr]
   end
 
+  # Computes the eigenvalues and, optionally, the left and/or right eigenvectors for a square symmetric/Hermitian matrix A.
+  def eigh(a, vals_only:false, uplo:false, turbo:false)
+    jobz = vals_only ? 'N' : 'V' # Jobz: compute eigenvalues and eigenvectors.
+    case blas_char(a)
+    when /c|z/
+      func = turbo ? :hegv : :heev
+    else
+      func = turbo ? :sygv : :syev
+    end
+
+    w, v, = Lapack.call(func, a, uplo:uplo, jobz:jobz)
+    return [w, v] #.compact
+  end
+
+  # Computes the eigenvalues only for a square nonsymmetric matrix A.
+  def eigvals(a)
+    jobvl, jobvr = 'N', 'N'
+    case blas_char(a)
+    when /c|z/
+      w, = Lapack.call(:geev, a, jobvl:jobvl, jobvr:jobvr)
+    else
+      wr, wi, = Lapack.call(:geev, a, jobvl:jobvl, jobvr:jobvr)
+      w = wr + wi * Complex::I
+    end
+    return w
+  end
+
+  # Computes the eigenvalues for a square symmetric/Hermitian matrix A.
+  def eigvalsh(a, uplo:false, turbo:false)
+    jobz = 'N' # Jobz: compute eigenvalues and eigenvectors.
+    case blas_char(a)
+    when /c|z/
+      func = turbo ? :hegv : :heev
+    else
+      func = turbo ? :sygv : :syev
+    end
+    Lapack.call(func, a, uplo:uplo, jobz:jobz)[0]
+  end
+
+  ## Norms and other numbers.
+
+  # Compute matrix or vector norm.
+  def norm(a, ord=nil, axis:nil, keep_dims:false)
+    a = Lattice::NArray.as_array(a)
+
+    # Check axis
+    if axis
+      case axis
+      when Integer
+        axis = [axis]
+      when Array
+        if axis.size < 1 || axis.size > 2
+          raise ArgumentError, "Axis option should be a 1 or two element array"
+        end
+      else
+        raise ArgumentError, "Invalid option for axis: #{axis}"
+      end
+
+      # Swap axes
+      if a.n_dim > 1
+        idx = (0...a.n_dim).to_a
+        tmp = [] of GenNum
+        axis.each do |i|
+          x = idx[i]
+          if x.nil?
+            raise ArgumentError, "Axis contains same dinension"
+          end
+          tmp << x
+          idx[i] = nil
+        end
+        idx.compact!
+        idx.concat(tmp)
+        a = a.transpose(*idx)
+      end
+    else
+      case a.n_dim
+      when 0
+        raise ArgumentError, "Zero-dimensional array"
+      when 1
+        axis = [-1]
+      else
+        axis = [-2, -1]
+      end
+    end
+
+    # Calculate norm
+    case axis.size
+    when 1 # Vector
+      k = keep_dims
+      ord ||= 2 # Default value
+      case ord.to_s
+      when "0"
+        r = a.class.cast(a.ne(0)).sum(axis:-1, keep_dims:k)
+      when "1"
+        r = a.abs.sum(axis:-1, keep_dims:k)
+      when "2"
+        r = Blas.call(:nrm2, a, keep_dims:k)
+      when /^-?\d+$/
+        o = ord.to_i
+        r = (a.abs * o).sum(axis:-1, keep_dims:k)**(1.0/o)
+      when /^inf(inity)?$/i
+        r = a.abs.max(axis:-1, keep_dims:k)
+      when /^-inf(inity)?$/i
+        r = a.abs.min(axis:-1, keep_dims:k)
+      else
+        raise ArgumentError, "Ord #{ord} is invalid for vector norm"
+      end
+
+    when 2 # Matrix
+      if keep_dims
+        fix_dims = [true] * a.n_dim
+        axis.each do |i|
+          if i < -a.n_dim || i >= a.n_dim
+            raise ArgumentError, "Axis (%d) is out of range", i
+          end
+          fix_dims[i] = :new
+        end
+      end
+      ord ||= "fro" # Default value
+      case ord.to_s
+      when "1"
+        r, = Lapack.call(:lange, a, '1')
+      when "-1"
+        r = a.abs.sum(axis:-2).min(axis:-1)
+      when "2"
+        svd, = Lapack.call(:gesvd, a, jobu:'N', jobvt:'N')
+        r = svd.max(axis:-1)
+      when "-2"
+        svd, = Lapack.call(:gesvd, a, jobu:'N', jobvt:'N')
+        r = svd.min(axis:-1)
+      when /^f(ro)?$/i
+        r, = Lapack.call(:lange, a, 'F')
+      when /^inf(inity)?$/i
+        r, = Lapack.call(:lange, a, 'I')
+      when /^-inf(inity)?$/i
+        r = a.abs.sum(axis:-1).min(axis:-1)
+      else
+        raise ArgumentError, "Ord #{ord} is invalid for matrix norm"
+      end
+      if keep_dims
+        if NArray === r
+          r = r[*fix_dims]
+        else
+          r = a.class.new(1, 1).store(r)
+        end
+      end
+    end
+    return r
+  end
+
+  # Compute the condition number of matrix using the norm with one of the following order.
+  def cond(a, ord=nil)
+    if ord.nil?
+      s = svd_vals(a)
+      s[false, 0] / s[false, -1]
+    else
+      norm(a, ord, axis:[-2, -1]) * norm(inv(a), ord. axis:[-2, -1])
+    end
+  end
+
+  # Determinant of a matrix.
+  def det(a)
+    lu, piv, = Lapack.call(:getrf, a)
+    idx = piv.new_narray.store(piv.class.new(piv.shape[-1]).seq(1))
+    m = piv.eq(idx).count_false(axis:-1) % 2
+    sign = m * -2 + 1
+    lu.diagonal.prod(axis:-1) * sign
+  end
+
+  # Natural logarithm of the determinant of a matrix.
+  def slogdet(a)
+    lu, piv, = Lapack.call(:getrf, a)
+    idx = piv.new_narray.store(piv.class.new(piv.shape[-1]).seq(1))
+    m = piv.eq(idx).count_false(axis:-1) % 2
+    sign = m * -2 + 1
+
+    lud = lu.diagonal
+    if (lud.eq 0).any?
+      return 0, (-Float::INFINITY)
+    end
+    lud_abs = lud.abs
+    sign *= (lud / lud_abs).prod
+    [sign, Math.log(lud_abs).sum(axis:-1)]
+  end
   
