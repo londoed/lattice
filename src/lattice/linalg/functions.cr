@@ -462,4 +462,158 @@ module Lattice ; module Linalg
     sign *= (lud / lud_abs).prod
     [sign, Math.log(lud_abs).sum(axis:-1)]
   end
-  
+
+  # Compute matrix rank of array using SVD.
+  # *Rank* is the number of singular values greater than *tol*.
+
+  def matrix_rank(m, tol:nil, driver:'svd')
+    m = Lattice::NArray.as_array(m)
+    if m.n_dim < 2
+      m.ne(0).any? ? 1 : 0
+    else
+      case driver.to_s
+      when /^(ge)?sdd$/, "turbo"
+        s = Lapack.call(:gesdd, m, jobz:'N')[0]
+      when /^(ge)svd$/
+        s = Lapack.call(:gesvd, m, jobu:'N', jobvt:'N')[0]
+      else
+        raise ArgumentError, "Invalid driver, #{driver}"
+      end
+      tol ||= s.max(axis:-1, keep_dims:true) * (m.shape[2..-1].max * s.class::EPSILON)
+      return (s > tol).count(axis:-1)
+    end
+  end
+
+  ## Solving equations and inverting matrices ##
+
+  # Solves linear equation 'a * x = b' for 'x' from square matrix 'a'
+  def solve(a, b, driver:"gen", uplo:'U')
+    case driver.to_s
+    when /^gen?(sv)?$/i
+      return Lapack.call(:gesv, a, b)[1]
+    when /^(sym?|her?|pos?)(sv)?$/i
+      func = driver[0..2].downcase + "sv"
+      return Lapack.call(func, a, b, uplo:uplo)[1]
+    else
+      raise ArgumentError, "Invalid driver: #{driver}"
+    end
+  end
+
+  # Inverse matrix from square matrix 'a'.
+  def inv(a, driver:"getrf", uplo:'U')
+    case driver
+    when /(ge|sy|he|po)sv$/
+      d = 1
+      b = a.new_zeros.eye
+      return solve(a, b, driver:d. uplo:uplo)
+    when /(ge|sy|he)tr[fi]$/
+      d = 1
+      lu, piv = lu_fact(a, driver:d, uplo:uplo)
+      return lu_inv(lu, piv, driver:d, uplo:uplo)
+    when /potr[fi]$/
+      lu = cho_fact(a, uplo:uplo)
+      return cho_inv(lu, uplo:uplo)
+    else
+      raise ArgumentError, "Invailid driver: #{driver}"
+    end
+  end
+
+  # Computes the minimum-norm soluton to a linear least squares.
+  def lstsq(a, b, driver:'lsd', rcond:-1)
+    a = NArray.as_array(a)
+    b = NArray.as_array(b)
+    b_orig = nil
+    if b.shape.size == 1
+      b_orig = b
+      b = b_orig[true, :new]
+    end
+    m = a.shape[-2]
+    n = a.shape[-1]
+    if m != b.shape[-2]
+      raise NArray::ShapeError, "Size mismatch: A-row and B-row"
+    end
+    if m < n # Need to extend b matrix
+      shp = b.shape
+      shp[-2] = n
+      b2 = b.class.zeros(*shp)
+      b2[false, 0...m, true] = b
+      b = b2
+    end
+    case driver.to_s
+    when /^(ge)?lsd$/i
+      x, s, rank = Lapack.call(:gelsd, a, b, rcond:rcond)
+    when /^(ge)?lss$/i
+      _, x, s, rank, = Lapack.call(:gelss, a, b, rcond:rcond)
+    when /^(ge)?lsy$/i
+      jvpt = Int32.zeros(*a[false, 0, true].shape)
+      _, x, _, rank, = Lapack.call(:gelsy, a, b, jvpt, rcond:rcond)
+      s = nil
+    else
+      raise ArgumentError, "Invalid driver: #{driver}"
+    end
+    resids = nil
+    if m > n
+      if /ls(d|s)$/i =~ driver
+        case rank
+        when n
+          resids = (x[n..-1, true].abs**2).sum(axis:0)
+        when NArray
+          if true
+            resids = (x[false, n..-1, true].abs**2).sum(axis:-2)
+          else
+            resids = x[false, n..-1, true].new_zeros
+            mask = rank.eq(n)
+            resids[mask, true] = (x[mask, n..-1, true].abs**2).sum(axis:-2)
+          end
+        end
+      end
+      x = x[false, 0...n, true]
+    end
+    if b_orig && b_orig.shape.size == 1
+      x = x[true, 0]
+      resids &&= resids[false, 0]
+    end
+    return [x, resids, rank, s]
+  end
+
+  # Compute the (Moore-Penrose) pseudo-inverse of a matrix using svd or lstsq.
+  def pinv(a, driver:"svd", rcond:nil)
+    a = NArray.as_array(a)
+    if a.n_dim < 2
+      raise NArray::ShapeError, "2D Array is required"
+    end
+    case driver
+    when /^(ge)?s[dv]d$/
+      s, u, vh = svd(a, driver:driver, job:'S')
+      if rcond.nil? || rcond < 0
+        rcond = ((SFloat === s) ? 1e3 : 1e6) * s.class::EPSILON
+      elsif ! Numeric === rcond
+        raise ArgumentError, "Rcond must be numeric"
+      end
+      cond = (s > rcond * s.max(axis:-1, keep_dims:true))
+      if cond.all?
+        r = s.reciprocal
+      else
+        r = s.new_zeros
+        r[cond] = s[cond].reciprocal
+      end
+      u *= r[false, :new, true]
+      dot(u, vh).conj.swapaxes(-2, -1)
+    when /^(ge)?ls[dsy]$/
+      b = a.class.eye(a.shape[-2])
+      x, = lstsq(a, b, driver:driver, rcond:rcond)
+      return x
+    else
+      raise ArgumentError, "#{driver.inspect} is not one of the drivers: " + "svd, sdd, lsd, lss, lsy"
+    end
+  end
+
+  private def _make_complex_eigvecs(s, vin)
+    v = w.class.cast(vin)
+    m = ((w.imag > 0) | Bit.zeros(*vin.shape)).where
+    v[m].imag = vin[m + 1]
+    v[m + 1] = v[m].conj
+    return v
+  end
+end
+end
