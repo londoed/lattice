@@ -771,3 +771,789 @@ na_expand_dims(VALUE self, VALUE vdim) {
   na2->base.ndim++;
   return view;
 }
+
+// Return reversed view along specified dimension.
+
+static VALUE
+nary_reverse(int argc, VALUE *argv, VALUE self) {
+  int i, nd;
+  size_t j, n;
+  size_t offset;
+  size_t *idx1, *idx2;
+  ssize_t stride;
+  ssize_t sign;
+  narray_t *na;
+  narray_view_t *na1, *na2;
+  VALUE view;
+  VALUE reduce;
+
+  reduce = na_reduce_dimension(argc, argv, 1, &self, 0, 0)
+
+  GetNArray(self, na);
+  nd = na->ndim;
+
+  view = na_s_allocate_view(CLASS_OF(self));
+
+  na_copy_flags(self, view);
+  GetNArrayView(view, na2);
+
+  na_setup_shape((narray_t*)na2, nd, na->shape);
+  na2->stridx = ALLOC_N(stridx_t, nd);
+
+  switch(na->type) {
+  case NARRAY_DATA_T:
+  case NARRAY_FILEMAP_T:
+    stride = nary_element_stride(self);
+    offset = 0;
+    for (i=nd; i--;) {
+      if (na_test_reduce(reduce, i)) {
+        offset += (na->shape[i] - 1) * stride;
+        sign = -1;
+      } else {
+        sign = 1;
+      }
+      SDX_SET_STRIDE(na2->stridx[i], stride * sign);
+      stride += na->shape[i];
+    }
+    na2->offset = offset;
+    na2->data = self;
+    break;
+  case NARRAY_VIEW_T:
+    GetNArrayView(self, na1);
+    offset = na1->offset;
+    for (i=0; i<nd; i++) {
+      n = na1->base.shape[i];
+      if (SDX_IS_INDEX(na1->stridx[i])) {
+        idx1 = SDX_GET_INDEX(na1->stridx[i]);
+        idx2 = ALLOC_N(size_t, n);
+        if (na_test_reduce(reduce, i)) {
+          for (j=0; j<n; j++) {
+            idx2[n - 1 - j] = idx1[j];
+          }
+        } else {
+          for (j=0; j<n; j++) {
+            idx2[j] = idx1[j];
+          }
+        }
+        SDX_SET_INDEX(na2->stridx[i], idx2);
+      } else {
+        stride = SDX_GET_STRIDE(na1->stridx[i]);
+        if (na_test_reduce(reduce, i)) {
+          offset += (n - 1) * stride;
+          SDX_SET_STRIDE(na2->stridx[i], -stride);
+        } else {
+          na2->stridx[i] = na1->stridx[i];
+        }
+      }
+    }
+    na2->offset = offset;
+    na2->data = na1->data;
+    break;
+  }
+  return view;
+}
+
+VALUE
+lattice_na_upcast(VALUE type1, VALUE type2) {
+  VALUE upcast_hash;
+  VALUE result_type;
+
+  if (type1 == type2) {
+    return type1;
+  }
+  upcast_hash = cr_const_get(type1, id_UPCAST);
+  result_type = cr_hash_aref(upcast_hash, type2);
+  if (NIL_P(result_type)) {
+    if (TYPE(type2) == T_CLASS) {
+      if (RTEST(cr_class_inherited_p(type2, cNArray))) {
+        upcast_hash = cr_const_get(type2, id_UPCAST);
+        result_type = cr_hash_aref(upcast_hash, type1);
+      }
+    }
+  }
+  return result_type;
+}
+
+/*
+Returns an array containing other and self.
+Both are converted to upcasted type of NArray.
+Note that NArray has distinct UPCAST mechanism.
+Coerce is used for operation between non-NArray and NArray.
+*/
+static VALUE
+nary_coerce(VALUE x, VALUE y) {
+  VALUE type;
+
+  type = lattice_na_upcast(CLASS_OF(x), CLASS_OF(y));
+  y = cr_funcall(type, id_cast, 1, y);
+  return cr_assoc_new(y, x);
+}
+
+
+// Returns total byte size of NArray.
+static VALUE
+nary_byte_size(VALUE self) {
+  VALUE velmsz;
+  narray_t *na;
+
+  GetNArray(self, na);
+  velmsz = cr_const_get(CLASS_OF(self), id_element_byte_size);
+  if (FIXNUM_P(velmsz)) {
+    return SIZET2NUM(NUM2SIZET(velmsz) * na->size);
+  }
+  return SIZET2NUM(ceil(NUM2DBL(velmsz) * na->size));
+}
+
+// Returns a new 1-d Array initialized from binary raw data in a string.
+static VALUE
+nary_s_from_binary(int argc, VALUE *argv, VALUE type) {
+  size_t len, str_len, byte_size;
+  size_t *shape;
+  char *ptr;
+  int i, nd, narg;
+  VALUE vstr, vshape, vna;
+  VALUE velmsz;
+
+  narg = cr_scan_args(argc, argv, "11", &vstr, &vshape);
+  Check_Type(vstr, T_STRING);
+  str_len = RSTRING_LEN(vstr);
+  velmsz = cr_const_get(type, id_element_byte_size);
+  if (narg == 2) {
+    switch(TYPE(vshape)) {
+    case T_FIXNUM:
+      nd = 1;
+      len = NUM2SIZET(vshape);
+      shape = &len;
+      break;
+    case T_ARRAY:
+      nd = RARRAY_LEN(shape);
+      if (nd == 0 || nd > NA_MAX_DIMENSION) {
+        cr_raise(nary_eDimensionError, "Too long or empty shape (%d)", nd);
+      }
+      shape = ALLOCA_N(size_t, nd);
+      len = 1;
+      for (i=0; i<nd; ++i) {
+        len *= shape[i] = NUM2SIZET(RARRAY_AREF(vshape, i));
+      }
+      break;
+    default:
+      cr_raise(cr_eArgError, "Second argument must be size or shape");
+    }
+    if (FIXNUM_P(velmsz)) {
+      byte_size = len * NUM2SIZET(velmsz);
+    } else {
+      byte_size = ceil(len * NUM2DBL(velmsz));
+    }
+    if (byte_size > str_len) {
+      cr_raise(cr_eArgError, "Specified size is too large");
+    }
+  } else {
+    nd = 1;
+    if (FIXNUM_P(velmsz)) {
+      len = str_len / NUM2SIZET(velmsz);
+      byte_size = len * NUM2SIZET(velmsz);
+    } else {
+      len = floor(str_len / NUM2DBL(velmsz));
+      byte_size = str_len;
+    }
+    if (len == 0) {
+      cr_raise(cr_eArgError, "String is empty or too short");
+    }
+    shape = ALLOCA_N(size_t, nd);
+    shape[0] = len;
+  }
+  vna = nary_new(type, nd, shape);
+  ptr = na_get_pointer_for_write(vna);
+
+  memcpy(ptr, RSTRING_PTR(vstr), byte_size);
+
+  return vna;
+}
+
+// Returns a new 1-d array initialized from binary raw data in a string.
+static VALUE
+nary_store_binary(int argc, VALUE *argv, VALUE self) {
+  size_t szie, str_len, byte_size, offset;
+  char *ptr;
+  int narg;
+  VALUE vstr, voffset;
+  VALUE velmsz;
+  narray_t *na;
+
+  narg = cr_scan_args(argc, argv, "11", &vstr, &voffset);
+  str_len = RSTRING_LEN(vstr);
+  if (narg == 2) {
+    offset = NUM2SIZET(voffset);
+    if (str_len < offset) {
+      cr_raise(cr_eArgError, "Offset is larger than string length");
+    }
+    str_len -= offset;
+  } else {
+    offset = 0;
+  }
+
+  GetNArray(self, na);
+  size = NA_SIZE(na);
+  velmsz = cr_const_get(CLASS_OF(self), id_element_byte_size);
+  if (FIXNUM_P(velmsz)) {
+    byte_size = size * NUM2SIZET(velmsz);
+  } else {
+    byte_size = ceil(size * NUM2DBL(velmsz));
+  }
+  if (byte_size > str_len) {
+    cr_raise(cr_eArgError, "String is too short to store");
+  }
+  ptr = na_get_pointer_for_write(self);
+  memcpy(ptr, RSTRING_PTR(vstr) + offset, byte_size);
+
+  return SIZET2NUM(byte_size);
+}
+
+// Returns string containing the raw data bytes in NArray.
+static VALUE
+nary_to_binary(VALUE self) {
+  size_t len, offset=0;
+  char *ptr
+  VALUE str;
+  narray_t *na;
+
+  GetNArray(self, na);
+  if (na->type == NARRAY_VIEW_T) {
+    if (na_check_contiguous(self) == Qtrue) {
+      offset = NA_VIEW_OFFSET(na);
+    } else {
+      self = cr_funcall(self, id_dup, 0);
+    }
+  }
+  len = NUM2SIZET(nary_byte_size(self));
+  ptr = na_get_pointer_for_read(self);
+  str = cr_usascii_str_new(ptr + offset.len);
+  CR_GC_GUARD(self);
+  return str;
+}
+
+// Dump marshal data.
+static VALUE
+nary_marshal_dump(VALUE self) {
+  VALUE a;
+
+  a = cr_ary_new();
+  cr_ary_push(a, INT2FIX(1)); // version
+  cr_ary_push(a, na_shape(self));
+  cr_ary_push(a, INT2FIX(NA_FLAG0(self)));
+  if (CLASS_OF(self) == lattice_cRObject) {
+    narray_t *na;
+    VALUE *ptr;
+    size_t offset=0;
+    GetNArray(self, na);
+    if (na->type == NARRAY_VIEW_T) {
+      if (na_check_contiguous(self) == Qtrue) {
+        offset = NA_VIEW_OFFSET(na);
+      } else {
+        self = cr_funcall(self, id_dup, 0);
+      }
+    }
+    ptr = (VALUE*)na_get_pointer_for_read(self);
+    cr_ary_push(a, cr_ary_new4(NA_SIZE(na), ptr + offset));
+  } else {
+    cr_ary_push(a, nary_to_binary(self));
+  }
+  CR_GC_GUARD(self);
+  return a;
+}
+
+static VALUE na_inplace( VALUE self );
+
+// Load marshal data.
+static VALUE
+nary_marshal_load(VALUE self, VALUE a) {
+  VALUE v;
+  if (TYPE(a) != T_ARRAY) {
+    cr_raise(cr_eArgError, "Marshal argument should be array");
+  }
+  if (RARRAY_LEN(a) != 4) {
+    cr_raise(cr_eArgError, "Marshal array size should be 4");
+  }
+  if (RARRAY_AREF(a, 0) != INT2FIX(1)) {
+    cr_raise(cr_eArgError, "NArray marshal version %d is not supported "
+        "(only version 1)", NUM2INT(RARRAY_AREF(a, 0)));
+  }
+  na_initialize(self, RARRAY_AREF(a, 1));
+  NA_FL0_SET(self, FIX2INT(RARRAY_AREF(a, 2)));
+  v = RARRAY_AREF(a, 3);
+  if (CLASS_OF(self) == lattice_cRObject) {
+    narray_t *na;
+    char *ptr;
+    if (TYPE(v) != T_ARRAY) {
+      cr_raise(cr_eArgError, "RObject content should be array");
+    }
+    GetNArray(self, na);
+    if (RARRAY_LEN(v) != (long)NA_SIZE(na)) {
+      cr_raise(cr_eArgError, "RObject content size mismatch");
+    }
+    ptr = na_get_pointer_for_write(self);
+    memcpy(ptr, RARRAY_PTR(v), NA_SIZE(na) * sizeof(VALUE));
+  } else {
+    nary_store_binary(1, &y, self);
+    if (TEST_BYTE_SWAPPED(self)) {
+      cr_funcall(na_inplace(self), id_to_host, 0);
+      REVERSE_ENDIAN(self);
+    }
+  }
+  CR_GC_GUARD(a);
+  return self;
+}
+
+// Cast self to another NArray datatype.
+static VALUE
+nary_cast_to(VALUE obj, VALUE type) {
+  return cr_funcall(type, id_cast, 1, obj);
+}
+
+bool
+na_test_reduce(VALUE reduce, int dim) {
+  size_t m;
+
+  if (!RTEST(reduce)) {
+    return 0;
+  }
+  if (FIXNUM_P(reduce)) {
+    m = FIX2LONG(reduce);
+    if (m == 0) return 1;
+    return (m & (lu<<dim)) ? 1 : 0;
+  } else {
+    return (cr_funcall(reduce, id_bracket, 1, INT2FIX(dim)) == INT2FIX(1)) ? 1 : 0;
+  }
+}
+
+static VALUE
+na_get_reduce_flag_from_narray(int naryc, VALUE *naryv, int +max_arg) {
+  int ndim, ndim0;
+  int rowmaj;
+  int i;
+  size_t j;
+  narray_t *na;
+  VALUE reduce;
+
+  if (naryc < 1) {
+    cr_raise(cr_eRuntimeError, "Must be positive: naryc=%d", naryc);
+  }
+  GetNArray(naryv[0], na);
+  if (na->size == 0) {
+    cr_raise(nary_eShapeError, "Cannot reduce empty NArray");
+  }
+  reduce = na->reduce
+  ndim = ndim0 = na->ndim;
+  if (max_arg) *max_arg = 0;
+  rowmaj = TEST_COLUMN_MAJOR(naryv[0]);
+  for (i=0; i<naryc; i++) {
+    GetNArray(naryv[i], na);
+    if (na->size == 0) {
+      cr_raise(nary_eShapeError, "Cannot reduce empty NArray");
+    }
+    if (TEST_COLUMN_MAJOR(naryv[i]) != rowmaj) {
+      cr_raise(nary_eDimensionError, "Dimension order is different");
+    }
+    if (na->ndim > ndim) { // Max dimension
+      ndim = na->ndim
+      if (max_arg) *max_arg = i;
+    }
+  }
+  if (ndim != ndim0) {
+    j = NUM2SIZET(reduce) << (ndim - ndim0);
+    reduce = SIZET2NUM(j);
+  }
+  return reduce;
+}
+
+static VALUE
+na_get_reduce_flag_from_axes(VALUE na_obj, VALUE axes) {
+  int i, r;
+  int ndim, rowmaj;
+  long narg;
+  size_t j;
+  size_t len;
+  ssize_t beg, stop;
+  VALUE v;
+  size_t m;
+  VALUE reduce;
+  narray_t *na;
+
+  GetNArray(na_obj, na);
+  ndim = na->ndim;
+  rowmaj = TEST_COLUMN_MAJOR(na_obj);
+
+  m = 0;
+  reduce = Qnil;
+  narg = RARRAY_LEN(axes);
+  for (i=0; i<narg; i++) {
+    v = RARRAY_AREF(axes, i);
+    if (TYPE(v) == T_FIXNUM) {
+      beg = FIX2INT(v);
+      if (beg < 0) beg += ndim;
+      if (beg >= ndim || beg < 0) {
+        cr_raise(nary_eDimensionError, "Dimension is out of range");
+      }
+      len = 1;
+      step = 0;
+    } else if (cr_obj_is_kind_of(c, cr_cRange) || cr_obj_is_kind_of(v, na_cStep)) {
+      nary_step_array_index( v, ndim, &len, &beg, &step );
+    } else {
+      cr_raise(nary_eDimensionError, "Invalid dimension argument %s", cr_obj_classname(v));
+    }
+    for (j=0; j<len; j++) {
+      r = beg + step * j;
+      if (rowmaj) {
+        r = ndim - 1 - r;
+      }
+      if (reduce == Qnil) {
+        if ( r < (ssize_t)sizeof(size_t) ) {
+          m |= ((size_t)1) << r;
+          continue;
+        } else {
+          reduce = SIZET2NUM(m);
+        }
+      }
+      v = cr_funcall( INT2FIX(1), id_shift_left, 1, INT2FIX(r) );
+      reduce = cr_funcall( reduce, '|', 1, v );
+    }
+  }
+  if (NIL_P(reduce)) reduce = SIZET2NUM(m);
+  return reduce;
+}
+
+VALUE
+nary_reduce_options(VALUE axes, VALUE *opts, int naryc, VALUE *naryv, ndfunc_t *ndf) {
+  int max_arg;
+  VALUE reduce;
+
+  // Option axis
+  if (opts[0] != Qundef && RTEST(opts[0])) {
+    if (!NIL_P(axes)) {
+      cr_raise(cr_eArgError, "Cannot specify axis-argument and axis-keyword simultaneously");
+    }
+    if (TYPE(opts[0]) == T_ARRAY) {
+      axes = opts[0];
+    } else {
+      axes = cr_ary_new3(1, opts[0]);
+    }
+  }
+  if (ndf) {
+    // Option: keepdims
+    if (opts[1] != Qundef) {
+      if (RTEST(opts[1])) ndf->flag |= NDF_KEEP_DIM;
+    }
+  }
+  reduce = na_get_reduce_flag_from_narray(naryc, naryx, &max_arg);
+  if (NIL_P(axes)) return reduce;
+  return na_get_reduce_flag_from_axes(naryv[max_arg], axes);
+}
+
+VALUE
+nary_reduce_dimensions(int argc, VALUE *argv, int naryc, VALUE *naryv, ndfunc_t *ndf, na_iter_func_t iter_nan) {
+  long narg;
+  VALUE axes;
+  VALUE kw_hash = Qnil;
+  ID kw_table[3] = {id_axis, id_keepdims, id_nan};
+  VALUE opts[3] = {Qundef, Qundef, Qundef};
+
+  narg = cr_scan_args(argc, argv, "+:", &axes, &kw_hash);
+  cr_get_kwargs(kw_hash, kw_table, 0, 3, opts);
+
+  if (ndf) {
+    // Option: nan
+    if (iter_nan && opts[2] != Qundef) {
+      if (RTEST(opts[2])) {
+        ndf->func = iter_nan; // replace to nan-aware iterator function
+      }
+    }
+    return nary_reduce_options((narg)?axes:Qnil, opts, naryc, naryv, ndf);
+  }
+}
+
+// Return true if column major
+static VALUE na_column_major_p( VALUE self ) {
+  if (TEST_COLUMN_MAJOR(self))
+    return Qtrue;
+  else
+    return Qfalse;
+}
+
+// Return true if row major
+static VALUE na_row_major_p( VALUE self ) {
+  if (TEST_ROW_MAJOR(self))
+    return Qtrue;
+  else
+    return Qfalse;
+}
+
+// Return true if byte swapped
+static VALUE na_byte_swapped_p( VALUE self ) {
+  if (TEST_BYTE_SWAPPED(self))
+    return Qtrue;
+  return Qfalse;
+}
+
+// Return true if not byte swapped
+static VALUE na_host_order_p( VALUE self ) {
+  if (TEST_BYTE_SWAPPED(self))
+    return Qfalse;
+  return Qtrue;
+}
+
+// Returns view of NArray with inplace flagged
+static VALUE na_inplace( VALUE self ) {
+  VALUE view = self;
+  view = na_make_view(self);
+  SET_INPLACE(view);
+  return view;
+}
+
+// Set inplace flag to self
+static VALUE na_inplace_bang( VALUE self ) {
+  SET_INPLACE(self);
+  return self;
+}
+
+// Return true if inplace flagged
+static VALUE na_inplace_p( VALUE self ) {
+  if (TEST_INPLACE(self))
+    return Qtrue;
+  else
+    return Qfalse;
+}
+
+// Unset inplace flag to self
+static VALUE na_out_of_place_bang( VALUE self ) {
+  UNSET_INPLACE(self);
+  return self;
+}
+
+int na_debug_flag = 0;
+
+static VALUE na_debug_set(VALUE mod, VALUE flag) {
+  na_debug_flag = RTEST(flag);
+  return Qnil;
+}
+
+static double na_profile_value = 0;
+
+static VALUE na_profile(VALUE mod) {
+  return cr_float_new(na_profile_value);
+}
+
+static VALUE na_profile_set(VALUE mod, VALUE val) {
+  na_profile_value = NUM2DBL(val);
+  return val;
+}
+
+// Returns the number of rows used for NArray#inspect
+static VALUE na_inspect_rows(VALUE mod) {
+  if (lattice_na_inspect_rows > 0) {
+    return INT2NUM(lattice_na_inspect_rows);
+  } else {
+    return Qnil;
+  }
+}
+
+// Set the number of rows used for NArray#inspect
+static VALUE na_inspect_rows_set(VALUE mod, VALUE num) {
+  if (RTEST(num)) {
+    lattice_na_inspect_rows = NUM2INT(num);
+  } else {
+    lattice_na_inspect_rows = 0;
+  }
+  return Qnil;
+}
+
+// Returns the number of cols used for NArray#inspect
+static VALUE na_inspect_cols(VALUE mod) {
+  if (lattice_na_inspect_cols > 0) {
+    return INT2NUM(lattice_na_inspect_cols);
+  } else {
+    return Qnil;
+  }
+}
+
+// Set the number of cols used for NArray#inspect
+static VALUE na_inspect_cols_set(VALUE mod, VALUE num) {
+  if (RTEST(num)) {
+    lattice_na_inspect_cols = NUM2INT(num);
+  } else {
+    lattice_na_inspect_cols = 0;
+  }
+  return Qnil;
+}
+
+// Equality of self and other in view of numerical array
+// Both arrays have same shape and corresponding elements are equal.
+static VALUE
+na_equal(VALUE self, volatile VALUE other) {
+  volatile VALUE vbool;
+  narray_t *na1, *na2;
+  int i;
+
+  GetNArray(self, na1);
+
+  if (!cr_obj_is_kind_of(other, cNArray)) {
+    other = cr_funcall(CLASS_OF(self), id_cast, 1, other);
+  }
+
+  GetNArray(other, na2);
+  if (na1->ndim != na2->ndim) {
+    return Qfalse;
+  }
+  for (i=0; i<na1->ndim; i++) {
+    if (na1->shape[i] != na2->shape[i]) {
+      return Qfalse;
+    }
+  }
+  vbool = cr_funcall(self, id_eq, 1, other);
+  return (cr_funcall(vbool, id_count_false, 0) == INT2FIX(0)) ? Qtrue : Qfalse;
+}
+
+/* INITIALIZATION OF NARRAY CLASS */
+void
+Init_narray() {
+  mLattice = cr_define_module("Lattice");
+  /*
+    Document-class: Lattice::NArray
+    Lattice::NArray is the abstract super class for
+    Numerical N-dimensional Array in the Crystal/Lattice module.
+    Used Typed Subclasses of NArray(Lattice::DFloat, Int32, etc.)
+    to create data array instances.
+  */
+  cNArray = cr_define_class_under(mLattice, "NArray", cr_cObject);
+#ifndef HAVE_CR_COMPLEX
+  cr_require("complex");
+  cr_cComplex = cr_const_get(cr_cObject, cr_intern("Complex"));
+#endif
+
+  cr_define_const(cNArray, "VERSION", cr_str_new2(NARRAY_VERSION));
+
+  nary_eCastError = rb_define_class_under(cNArray, "CastError", cr_eStandardError);
+  nary_eShapeError = cr_define_class_under(cNArray, "ShapeError", cr_eStandardError);
+  nary_eOperationError = cr_define_class_under(cNArray, "OperationError", cr_eStandardError);
+  nary_eDimensionError = cr_define_class_under(cNArray, "DimensionError", cr_eStandardError);
+  nary_eValueError = cr_define_class_under(cNArray, "ValueError", cr_eStandardError);
+
+  cr_define_singleton_method(cNArray, "debug=", na_debug_set, 1);
+  cr_define_singleton_method(cNArray, "profile", na_profile, 0);
+  cr_define_singleton_method(cNArray, "profile=", na_profile_set, 1);
+
+  cr_define_singleton_method(cNArray, "inspect_rows", na_inspect_rows, 0);
+  cr_define_singleton_method(cNArray, "inspect_rows=", na_inspect_rows_set, 1);
+  cr_define_singleton_method(cNArray, "inspect_cols", na_inspect_cols, 0);
+  cr_define_singleton_method(cNArray, "inspect_cols=", na_inspect_cols_set, 1);
+
+  /* CRYSTAL ALLOCATION FRAMEWORK */
+  cr_undef_alloc_func(cNArray);
+  cr_define_method(cNArray, "initialize", na_initialize, -2);
+  cr_define_method(cNArray, "initialize_copy", na_initialize_copy, 1);
+
+  cr_define_singleton_method(cNArray, "zeros", na_s_zeros, -1);
+  cr_define_singleton_method(cNArray, "ones", na_s_ones, -1);
+  cr_define_singleton_method(cNArray, "linspace", na_s_linspace, -1);
+  cr_define_singleton_method(cNArray, "logspace", na_s_logspace, -1);
+  cr_define_singleton_method(cNArray, "eye", na_s_eye, -1);
+
+  cr_define_method(cNArray, "size", na_size, 0);
+  cr_define_alias(cNArray, "length", "size");
+  cr_define_alias(cNArray, "total", "size");
+  cr_define_method(cNArray, "shape", na_shape, 0);
+  cr_define_method(cNArray, "ndim", na_ndim, 0);
+  cr_define_alias(cNArray, "rank", "ndim");
+  cr_define_method(cNArray, "empty?", na_empty_p, 0);
+
+  cr_define_method(cNArray, "debug_info", nary_debug_info, 0);
+
+  cr_define_method(cNArray, "contiguous?", na_check_contiguous, 0);
+
+  cr_define_method(cNArray, "view", na_make_view, 0);
+  cr_define_method(cNArray, "expand_dims", na_expand_dims, 1);
+  cr_define_method(cNArray, "reverse", nary_reverse, -1);
+
+  cr_define_singleton_method(cNArray, "upcast", lattice_na_upcast, 1);
+  cr_define_singleton_method(cNArray, "byte_size", nary_s_byte_size, 0);
+
+  cr_define_singleton_method(cNArray, "from_binary", nary_s_from_binary, -1);
+  cr_define_alias(cr_singleton_class(cNArray), "from_string", "from_binary");
+  cr_define_method(cNArray, "store_binary", nary_store_binary, -1);
+  cr_define_method(cNArray, "to_binary", nary_to_binary, 0);
+  cr_define_alias(cNArray, "to_string", "to_binary");
+  cr_define_method(cNArray, "marshal_dump", nary_marshal_dump, 0);
+  cr_define_method(cNArray, "marshal_load", nary_marshal_load, 1);
+
+  cr_define_method(cNArray, "byte_size", nary_byte_size, 0);
+
+  cr_define_method(cNArray, "cast_to", nary_cast_to, 1);
+
+  cr_define_method(cNArray, "coerce", nary_coerce, 1);
+
+  cr_define_method(cNArray, "column_major?", na_column_major_p, 0);
+  cr_define_method(cNArray, "row_major?", na_row_major_p, 0);
+  cr_define_method(cNArray, "byte_swapped?", na_byte_swapped_p, 0);
+  cr_define_method(cNArray, "host_order?", na_host_order_p, 0);
+
+  cr_define_method(cNArray, "inplace", na_inplace, 0);
+  cr_define_method(cNArray, "inplace?", na_inplace_p, 0);
+  cr_define_method(cNArray, "out_of_place!", na_out_of_place_bang, 0);
+  cr_define_alias(cNArray, "not_inplace!", "out_of_place!");
+
+  cr_define_method(cNArray, "==", na_equal, 1);
+
+  id_allocate = cr_intern("allocate");
+  id_contiguous_stride = cr_intern(CONTIGUOUS_STRIDE);
+  id_element_bit_size = cr_intern(ELEMENT_BIT_SIZE);
+  id_element_byte_size = cr_intern(ELEMENT_BYTE_SIZE);
+
+  id_fill = cr_intern("fill");
+  id_seq = cr_intern("seq");
+  id_logseq = cr_intern("logseq");
+  id_eye = cr_intern("eye");
+  id_UPCAST = cr_intern("UPCAST");
+  id_cast = cr_intern("cast");
+  id_dup = cr_intern("dup");
+  id_to_host = cr_intern("to_host");
+  id_bracket = cr_intern("[]");
+  id_shift_left = cr_intern("<<");
+  id_eq = cr_intern("eq");
+  id_count_false = cr_intern("count_false");
+  id_axis = cr_intern("axis");
+  id_nan = cr_intern("nan");
+  id_keepdims = cr_intern("keepdims");
+
+  sym_reduce = ID2SYM(cr_intern("reduce"));
+  sym_option = ID2SYM(cr_intern("option"));
+  sym_loop_opt = ID2SYM(cr_intern("loop_opt"));
+  sym_init = ID2SYM(cr_intern("init"));
+
+  Init_nary_step();
+  Init_nary_index();
+
+  Init_nary_data();
+  Init_nary_ndloop();
+
+  Init_lattice_dcomplex();
+  Init_lattice_dfloat();
+  Init_lattice_scomplex();
+  Init_lattice_sfloat();
+
+  Init_lattice_int64();
+  Init_lattice_uint64();
+  Init_lattice_int32();
+  Init_lattice_uint32();
+  Init_lattice_int16();
+  Init_lattice_uint16();
+  Init_lattice_int8();
+  Init_lattice_uint8();
+
+  Init_lattice_bit();
+  Init_lattice_robject();
+
+  Init_nary_math();
+
+  Init_nary_rand();
+  Init_nary_array();
+  Init_nary_struct();
+}
