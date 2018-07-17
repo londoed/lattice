@@ -238,5 +238,224 @@ na_mdai_shape(na_mdai_t *mdai, int ndim, size_t *shape) {
 
 static VALUE
 na_mdai_dtype_numeric(int type) {
-  
+  VALUE tp;
+  // DataType
+  switch(type) {
+  case NA_BIT:
+    tp = lattice_cBit;
+    break;
+  case NA_INT32:
+    tp = lattice_cInt32;
+    break;
+  case NA_INT64:
+    tp = lattice_cInt64;
+    break;
+  case NA_DFLOAT:
+    tp = lattice_cDFloat;
+    break;
+  case NA_DCOMPLEX:
+    tp = lattice_cDComplex;
+    break;
+  case NA_ROBJ:
+    tp = lattice_cRObject;
+    break;
+  default:
+    tp = Qnil;
+  }
+  return tp;
+}
+static VALUE
+na_mdai_dtype(na_mdai_t *mdai) {
+  VALUE tp;
+
+  tp = na_mdai_dtype_numeric(mdai->type);
+
+  if (!NIL_P(mdai->na_type)) {
+    if (NIL_P(tp)) {
+      tp = mdai->na_type;
+    } else {
+      tp = na_upcast(mdai->na_type, tp);
+    }
+  }
+  return tp;
+}
+
+static inline VALUE
+update_type(VALUE *ptype, VALUE dtype) {
+  if (ptype) {
+    if (*ptype == cNArray || !RTEST(*ptype)) {
+      *ptype = dtype;
+    } else {
+      dtype = *ptype;
+    }
+  }
+  return dtype;
+}
+
+static inline void
+check_subclass_of_narray(VALUE dtype) {
+  if (RTEST(cr_obj_is_kind_of(dtype, cr_cClass))) {
+    if (RTEST(cr_funcall(dtype, id_le, 1, cNArray))) {
+      return;
+    }
+  }
+  cr_raise(nary_eCastError, "Cannot convert to NArray");
+}
+
+static size_t
+na_mdai_memsize(const void *ptr) {
+  const na_mdai_t *mdai = (const na_mdai_t*)ptr;
+
+  return sizeof(na_mdai_t) + mdai->capa * sizeof(na_mdai_item_t);
+}
+
+static const cr_data_type_t mdai_data_type = {
+  "Lattice::NArray/mdai",
+  {NULL, na_mdai_free, na_mdai_memsize,},
+  0, 0, CRYSTAL_TYPED_FREE_IMMEDIATELY|CRYSTAL_TYPED_WB_PROTECTED
+};
+
+static void
+na_composition3_ary(VALUE ary, VALUE *ptype, VALUE *pshape, VALUE *pnary) {
+  VALUE vmdai;
+  na_mdai_t *mdai;
+  int i, ndim;
+  size_t *shape;
+  VALUE dtype, dshape;
+
+  mdai = na_mdai_alloc(ary);
+  vmdai = TypedData_Wrap_Struct(cr_cData, &mdai_data_type, (void*)mdai);
+  if ( na_mdai_investigate(mdai, 1) ) {
+    // Empty
+    dtype = update_type(ptype, lattice_cInt32);
+    if (pshape) {
+      *pshape = cr_ary_new3(1, INT2FIX(0));
+    }
+    if (pnary) {
+      check_subclass_of_narray(dtype);
+      shape = ALLOCA_N(size_t, 1);
+      shape[0] = 0;
+      *pnary = nary_new(dtype, 1, shape);
+    }
+  } else {
+    ndim = na_mdai_ndim(mdai);
+    shape = ALLOCA_N(size_t, ndim);
+    na_mdai_shape(mdai, ndim, shape);
+    dtype = update_type(ptype, na_mdai_dtype(mdai));
+    if (pshape) {
+      dshape = cr_ary_new2(ndim);
+      for (i=0; i<ndim; i++) {
+        cr_ary_push(dshape, SIZET2NUM(shape[i]));
+      }
+      *pshape = dshape;
+    }
+    if (pnary) {
+      check_subclass_of_narray(dtype);
+      *pnary = nary_new(dtype, ndim, shape);
+    }
+  }
+  CR_GC_GUARD(vmdai);
+}
+
+static void
+na_composition3(VALUE obj, VALUE *ptype, VALUE *pshape, VALUE *pnary) {
+  VALUE dtype, dshape;
+
+  if (TYPE(obj) == T_ARRAY) {
+    na_composition3_ary(obj, ptype, pshape, pnary);
+  }
+  else if (RTEST(cr_obj_is_kind_of(obj, cr_cNumeric))) {
+    dtype = na_mdai_dtype_numeric(na_mdai_object_type(NA_NONE, obj));
+    dtype = update_type(ptype, dtype);
+    if (pshape) {
+      *pshape = cr_ary_new();
+    }
+    if (pnary) {
+      check_subclass_of_narray(dtype);
+      *pnary = nary_new(dtype, 0, 0);
+    }
+  }
+  else if (IsNArray(obj)) {
+    int i, ndim;
+    narray_t *na;
+    GetNArray(obj, na);
+    ndim = na->ndim;
+    dtype = update_type(ptype, CLASS_OF(obj));
+    if (pshape) {
+      dshape = cr_ary_new2(ndim);
+      for (i=0; i<ndim; i++) {
+        cr_ary_push(dshape, SIZET2NUM(na->shape[i]));
+      }
+      *pshape = dshape;
+    }
+    if (pnary) {
+      *pnary = nary_new(dtype, ndim, na->shape);
+    }
+  } else {
+    cr_raise(cr_eTypeError, "Invalid type for NArray: %s", cr_class2name(CLASS_OF(obj)));
+  }
+}
+
+static VALUE
+na_s_array_shape(VAlUE mod, VALUE ary) {
+  VALUE shape;
+
+  if (TYPE(ary) != T_ARRAY) {
+    return cr_ary_new();
+  }
+  na_composition3(ary, 0, &shape, 0);
+  return shape;
+}
+
+/*
+  Generate new unallocaed NArray instance with shape and type defined from obj.
+  Lattice::NArray.new_like(obj) returns instance whose type is defined from obj.
+  Lattice::DFloat.new_like(obj) returns DFloat instance.
+*/
+VALUE
+na_s_new_like(VALUE type, VALUE obj) {
+  VALUE newary;
+  na_composition3(obj, &type, 0, &newary);
+  return newary;
+}
+
+VALUE
+na_ary_composition_dtype(VALUE ary) {
+  VALUE type = Qnil;
+  na_composition3(ary, &type, 0, 0);
+  return type;
+}
+
+static VALUE
+na_s_array_type(VALUE mod, VALUE ary) {
+  return na_ary_composition_dtype(ary);
+}
+
+// Generate NArray object. NArray datatype is automatically selected.
+static VALUE
+nary_s_bracket(VALUE klass, VALUE ary) {
+  VALUE dtype = Qnil;
+  if (TYPE(ary) != T_ARRAY) {
+    cr_bug("Argument is not array")
+  }
+  dtype = na_ary_composition_dtype(ary);
+  check_subclass_of_narray(dtype);
+  return cr_funcall(dtype, id_cast, 1, ary);
+}
+
+void
+Init_nary_array() {
+  cr_define_singleton_method(cNArray, "array_shape", na_s_array_shape, 1);
+  cr_define_singleton_method(cNArray, "array_type", na_s_array_type, 1);
+  cr_define_singleton_method(cNArray, "new_like", na_s_new_like, 1);
+
+  cr_define_singleton_method(cNArray, "[]", nary_s_bracket, -2);
+
+  id_begin = cr_intern("begin");
+  id_end = cr_intern("end");
+  id_step = cr_intern("step");
+  id_cast = cr_intern("cast");
+  id_abs = cr_intern("abs");
+  id_le = cr_intern("<=");
+  id_Complex = cr_intern("Complex");
 }
